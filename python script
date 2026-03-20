@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+import asyncio
+import aiohttp
+import json
+import websockets
+import re
+import time
+import sys
+import requests
+
+# ===== Config =====
+VACUGLIDE_DISCOVER = "https://latency.autoblowapi.com/vacuglide/connected"
+VACUGLIDE_TOKEN = "0123456789"  # <---- REPLACE WITH YOUR TOKEN
+WS_URL = "ws://127.0.0.1:54817"
+THROTTLE_INTERVAL = 0.3
+SPEED_THRESHOLD = 2
+MIN_SPEED = 5
+IDLE_STOP_SECONDS = 0.5
+REQUEST_TIMEOUT = 5
+
+HEADERS = {
+    "User-Agent": "VacuglideClient/1.0",
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "x-device-token": VACUGLIDE_TOKEN
+}
+
+_TCODE_RE = re.compile(r"^L(\d{1,3})I(\d+)", re.IGNORECASE)
+
+# ===== Internal State =====
+_last_speed = 0
+_last_command_time = 0.0
+_last_stop_time = 0.0
+_last_update = 0.0
+session = None  # aiohttp session
+
+# ===== Per-source aggregation (NEW) =====
+_sources = {}          # map source_id -> (percent_last, timestamp)
+CHANNEL_TIMEOUT = 0.6  # seconds before a source is considered stale
+
+# ===== Parameters used by the percent calculation (unchanged elsewhere) =====
+STEP_RANGE = 255.0     # assumed step range for the first field (position)
+INTENSITY_MAX = 1000.0 # observed practical max for Iyyy
+
+# ===== Functions =====
+def discover_cluster():
+    try:
+        r = requests.get(VACUGLIDE_DISCOVER, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        data = r.json()
+        print("[VacuGlide] discovery:", data)
+        cluster = data.get("cluster")
+        if not cluster:
+            print("[VacuGlide] no cluster returned")
+            return None
+        if not (cluster.startswith("http://") or cluster.startswith("https://")):
+            cluster = "https://" + cluster
+        cluster = cluster.rstrip("/")
+        print("[VacuGlide] cluster URL:", cluster)
+        return cluster
+    except Exception as e:
+        print("[VacuGlide] cluster discovery failed:", e)
+        return None
+
+def _compute_percent_from_fields(step: int, intensity: int) -> int:
+    """
+    Combine step and intensity into a single percent (0-100).
+    - step is normalized by STEP_RANGE (commonly 255)
+    - intensity is normalized by INTENSITY_MAX (observed ~1000)
+    """
+    step_norm = max(0.0, min(1.0, float(step) / STEP_RANGE))
+    intensity_norm = max(0.0, min(1.0, float(intensity) / INTENSITY_MAX))
+    percent = int(round(step_norm * intensity_norm * 100.0))
+    return max(0, min(100, percent))
+
+def _expire_sources(now: float):
+    """Remove stale sources older than CHANNEL_TIMEOUT"""
+    stale = [k for k, v in _sources.items() if now - v[1] > CHANNEL_TIMEOUT]
+    for k in stale:
+        del _sources[k]
+
+def handle_tcode_and_get_effective_speed(txt: str):
+    """
+    Parse a TCode string, update per-source state, expire stale sources,
+    and return the effective percent (max across active sources) or None.
+    """
+    if not txt:
+        return None
+    m = _TCODE_RE.match(txt.strip())
+    if not m:
+        return None
+
+    # source_id we use as the first numeric field (Lxxx)
+    source_id = int(m.group(1))
+    intensity = int(m.group(2))
+
+    # compute percent for this source
+    percent = _compute_percent_from_fields(source_id, intensity)
+
+    # update source table
+    now = time.time()
+    _sources[source_id] = (percent, now)
+
+    # expire old sources
+    _expire_sources(now)
+
+    # effective percent is the max percent among active sources
+    if not _sources:
+        return 0
+    effective = max(v[0] for v in _sources.values())
+    return effective
+
+# --- Async VacuGlide control ---
+async def send_stop(cluster_base: str):
+    global _last_speed
+    body = {
+        'operationalMode': 'TARGET_SPEED_PAUSED',
+        'localScript': 17,
+        'targetSpeed': 0,
+        'strokePlusValve': False,
+        'strokeMinusValve': False,
+        'syncScriptCurrentTime': 0,
+        'syncScriptOffsetTime': 0,
+        'syncScriptToken': 'dummy-token',
+        'syncScriptLoop': False
+    }
+    try:
+        async with session.put(f"{cluster_base}/vacuglide/target-speed", json=body) as resp:
+            if resp.status == 200:
+                _last_speed = 0
+                print("[VacuGlide] STOP → OK")
+            else:
+                print(f"[VacuGlide] Failed STOP → {resp.status}")
+    except Exception as e:
+        print(f"[VacuGlide] stop error: {e}")
+
+async def send_speed(cluster_base: str, speed: int):
+    global _last_speed, _last_update
+    now = time.time()
+    if now - _last_update < THROTTLE_INTERVAL:
+        return
+    if speed > 0 and speed < MIN_SPEED:
+        speed = MIN_SPEED
+    if abs(speed - _last_speed) < SPEED_THRESHOLD and speed != 0:
+        return
+    if speed == 0:
+        await send_stop(cluster_base)
+        _last_update = now
+        return
+    body = {
+        'operationalMode': 'TARGET_SPEED_PLAYING',
+        'localScript': 17,
+        'targetSpeed': speed,
+        'strokePlusValve': False,
+        'strokeMinusValve': False,
+        'syncScriptCurrentTime': 0,
+        'syncScriptOffsetTime': 0,
+        'syncScriptToken': 'dummy-token',
+        'syncScriptLoop': False
+    }
+    try:
+        async with session.put(f"{cluster_base}/vacuglide/target-speed", json=body) as resp:
+            if resp.status == 200:
+                _last_speed = speed
+                _last_update = now
+                print(f"[VacuGlide] Sent speed: {speed} → OK")
+            else:
+                print(f"[VacuGlide] speed error → {resp.status}")
+    except Exception as e:
+        print(f"[VacuGlide] speed error: {e}")
+
+# ===== Bridge =====
+async def run_bridge(cluster_base: str):
+    global session, _last_command_time, _last_stop_time
+    async with aiohttp.ClientSession(headers=HEADERS) as sess:
+        session = sess
+        async with websockets.connect(WS_URL, ping_interval=10, ping_timeout=10) as ws:
+            print("[Bridge] Connected to Intiface")
+            handshake = {"identifier": "restim", "address": "VACUGLIDE01", "version": 0}
+            await ws.send(json.dumps(handshake))
+            print("[Bridge] Handshake sent")
+            try:
+                while True:
+                    frame = await ws.recv()
+                    text = frame.decode("utf-8") if isinstance(frame, bytes) else frame
+                    if not text:
+                        continue
+                    text = text.strip()
+                    print(f"[Bridge] Got TCode: {text}")
+
+                    if text.upper().startswith("L"):
+                        # update per-source state and get aggregated effective speed
+                        effective = handle_tcode_and_get_effective_speed(text)
+                        if effective is None:
+                            await ws.send(b"OK;")
+                            continue
+
+                        # send only when there's a real change (send_speed will also throttle)
+                        await send_speed(cluster_base, int(max(0, min(100, effective))))
+                        await ws.send(b"OK;")
+                        _last_command_time = time.time()
+                    else:
+                        await ws.send(b"OK;")
+
+                    # Idle STOP: if no commands for a while, call STOP
+                    if time.time() - _last_command_time > IDLE_STOP_SECONDS:
+                        if time.time() - _last_stop_time > IDLE_STOP_SECONDS:
+                            await send_stop(cluster_base)
+                            _last_stop_time = time.time()
+                            _last_command_time = time.time()
+            except Exception as exc:
+                print("[Bridge] exception:", exc)
+                await send_stop(cluster_base)
+
+# ===== Main =====
+def main():
+    cluster = discover_cluster()
+    if not cluster:
+        print("[Bridge] Fatal: VacuGlide cluster detection failed!")
+        sys.exit(1)
+    print("[Bridge] Using cluster:", cluster)
+    try:
+        asyncio.run(run_bridge(cluster))
+    except KeyboardInterrupt:
+        print("[Bridge] KeyboardInterrupt → exiting")
+
+if __name__ == "__main__":
+    main()
